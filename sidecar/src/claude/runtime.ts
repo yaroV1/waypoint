@@ -4,11 +4,22 @@ import { accessSync, constants } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
 import { query } from '@anthropic-ai/claude-agent-sdk';
-import type { AccountInfo, CanUseTool, EffortLevel, Options, Query, SDKMessage, SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
+import type {
+  AccountInfo,
+  CanUseTool,
+  EffortLevel,
+  Options,
+  PermissionResult,
+  PermissionUpdate,
+  Query,
+  SDKMessage,
+  SDKUserMessage,
+} from '@anthropic-ai/claude-agent-sdk';
 import type {
   AgentEvent,
   AgentRuntime,
   AgentSession,
+  ApprovalRequest,
   InteractionResponse,
   RuntimeStatus,
   SessionOptions,
@@ -94,6 +105,8 @@ class InputQueue implements AsyncIterable<SDKUserMessage> {
   }
 }
 
+type OpenRequest = { toolUseID: string; rules: PermissionUpdate[]; resolve: (r: PermissionResult) => void };
+
 class ClaudeSession implements AgentSession {
   readonly id = randomUUID();
   readonly providerRef: { provider: 'claude'; nativeId: string };
@@ -103,6 +116,7 @@ class ClaudeSession implements AgentSession {
   private readonly onClosed: () => void;
   private readonly tools = new Map<string, ActivityFields>(); // by tool_use id
   private readonly denied = new Set<string>(); // tool_use ids
+  private readonly requests = new Map<string, OpenRequest>(); // by Waypoint requestId
   private seq = 0;
   private turnActive = false;
   private turnId: string | null = null;
@@ -127,11 +141,51 @@ class ClaudeSession implements AgentSession {
     return this.q.accountInfo();
   }
 
-  // Slice 3: no interaction UI yet. Deny whatever asks; the turn continues.
-  private readonly canUseTool: CanUseTool = async (toolName, _input, { toolUseID }) => {
-    this.denied.add(toolUseID);
-    this.emit({ type: 'notice', level: 'warning', message: `${toolName} denied (approvals and questions are not implemented yet)` });
-    return { behavior: 'deny', message: 'This session is read-only and cannot ask for approval yet; the tool call was not approved.' };
+  // The promise is held until respond(); the turn blocks meanwhile (design G).
+  private readonly canUseTool: CanUseTool = async (toolName, input, { signal, suggestions, title, toolUseID }) => {
+    const turnId = this.turnId;
+    if (!turnId) return { behavior: 'deny', message: 'No turn is active.' };
+    // Questions come in slice 5.
+    if (toolName === 'AskUserQuestion') {
+      this.denied.add(toolUseID);
+      this.emit({ type: 'notice', level: 'warning', message: `${toolName} denied (questions are not implemented yet)` });
+      return { behavior: 'deny', message: 'This client cannot answer questions yet; continue without asking.' };
+    }
+
+    const requestId = randomUUID();
+    // Only additive suggestions, and never into a settings file: the CLI proposes `localSettings`.
+    const rules = (suggestions ?? [])
+      .filter((s) => s.type === 'addRules' || s.type === 'addDirectories')
+      .map((s) => ({ ...s, destination: 'session' as const }));
+    const grants = rules.map((s) =>
+      s.type === 'addRules'
+        ? s.rules.map((r) => (r.ruleContent ? `${r.toolName}(${r.ruleContent})` : r.toolName)).join(', ')
+        : `directories ${s.directories.join(', ')}`,
+    );
+    const options: ApprovalRequest['options'] = [
+      { id: 'allow', label: 'Approve', effect: 'allow' },
+      ...(rules.length
+        ? [{ id: 'allow-session', label: `Approve for this session: ${grants.join('; ')}`, effect: 'allow-session' as const }]
+        : []),
+      { id: 'deny', label: 'Decline', effect: 'deny' },
+      { id: 'cancel-turn', label: 'Cancel turn', effect: 'cancel-turn' },
+    ];
+    const request: ApprovalRequest = { kind: 'approval', title: title ?? toolName, detail: describeTool(toolName, input).title, options };
+    this.emit({ type: 'request.opened', turnId, requestId, request, raw: { toolName, input, suggestions, toolUseID } });
+
+    return new Promise<PermissionResult>((resolve) => {
+      this.requests.set(requestId, { toolUseID, rules, resolve });
+      signal.addEventListener(
+        'abort',
+        () => {
+          if (!this.requests.delete(requestId)) return;
+          this.denied.add(toolUseID);
+          this.emit({ type: 'request.resolved', requestId, by: 'provider' });
+          resolve({ behavior: 'deny', message: 'The request was aborted.' });
+        },
+        { once: true },
+      );
+    });
   };
 
   async startTurn(input: string): Promise<{ turnId: string }> {
@@ -145,14 +199,44 @@ class ClaudeSession implements AgentSession {
     return { turnId };
   }
 
-  async respond(_requestId: string, _r: InteractionResponse): Promise<void> {
-    throw new Error('approvals and questions are not implemented yet (slices 4-5)');
+  async respond(requestId: string, r: InteractionResponse): Promise<void> {
+    const req = this.requests.get(requestId);
+    if (!req) throw new Error(`unknown request: ${requestId}`);
+    if (!('optionId' in r)) throw new Error('an approval expects { optionId }');
+    let result: PermissionResult;
+    switch (r.optionId) {
+      case 'allow':
+        result = { behavior: 'allow' };
+        break;
+      case 'allow-session':
+        result = { behavior: 'allow', updatedPermissions: req.rules };
+        break;
+      case 'deny':
+        result = { behavior: 'deny', message: 'The user declined this tool call.' };
+        break;
+      case 'cancel-turn':
+        this.interruptRequested = true;
+        result = { behavior: 'deny', message: 'The user declined this tool call and cancelled the turn.', interrupt: true };
+        break;
+      default:
+        throw new Error(`unknown option: ${r.optionId}`);
+    }
+    this.requests.delete(requestId);
+    if (result.behavior === 'deny') this.denied.add(req.toolUseID);
+    req.resolve(result);
+    this.emit({ type: 'request.resolved', requestId, by: 'user' });
   }
 
   async interrupt(): Promise<void> {
     if (!this.turnActive) return;
     // the SDK reports an interrupt as `error_during_execution`; remember that we asked for it
     this.interruptRequested = true;
+    for (const [requestId, req] of this.requests) {
+      this.requests.delete(requestId);
+      this.denied.add(req.toolUseID);
+      req.resolve({ behavior: 'deny', message: 'The turn was cancelled.', interrupt: true });
+      this.emit({ type: 'request.resolved', requestId, by: 'interrupt' });
+    }
     await this.q.interrupt();
   }
 

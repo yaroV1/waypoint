@@ -3,6 +3,9 @@
 //   node src/harness.ts <provider>                                 probe only, no model usage
 //   node src/harness.ts <provider> <cwd> "<prompt>" [model] [effort]
 //
+// Approval requests are answered from stdin: an option number or id per line
+// (interactive, or scripted: `printf 'decline\n' | node src/harness.ts …`).
+//
 // WAYPOINT_RAW=1    print full event JSON (including `raw`)
 // WAYPOINT_TRACE=1  sidecar logs provider wire traffic to stderr
 
@@ -42,7 +45,48 @@ function println(s: string): void {
 
 let turnEnded: (e: Extract<AgentEvent, { type: 'turn.ended' }>) => void = () => {};
 
-function onEvent(e: AgentEvent): void {
+// stdin lines, queued so scripted answers can arrive before the request does
+const answers: string[] = [];
+let answerWaiter: { resolve: (line: string) => void; reject: (e: Error) => void } | null = null;
+let stdinRl: ReturnType<typeof createInterface> | null = null;
+let stdinClosed = false;
+function readAnswer(): Promise<string> {
+  stdinRl ??= createInterface({ input: process.stdin })
+    .on('line', (line) => {
+      if (answerWaiter) {
+        answerWaiter.resolve(line);
+        answerWaiter = null;
+      } else answers.push(line);
+    })
+    .on('close', () => {
+      stdinClosed = true;
+      answerWaiter?.reject(new Error('stdin closed before the request was answered'));
+    });
+  const queued = answers.shift();
+  if (queued !== undefined) return Promise.resolve(queued);
+  if (stdinClosed) return Promise.reject(new Error('stdin closed before the request was answered'));
+  return new Promise((resolve, reject) => (answerWaiter = { resolve, reject }));
+}
+
+async function answerRequest(e: Extract<AgentEvent, { type: 'request.opened' }>): Promise<void> {
+  if (e.request.kind !== 'approval') return println(`[request.opened] ${e.request.kind} requests are not supported by the harness yet`);
+  const { title, detail, options } = e.request;
+  println(`[request.opened] ${title}${detail ? `\n  ${detail.replaceAll('\n', '\n  ')}` : ''}`);
+  options.forEach((o, i) => println(`  ${i + 1}) ${o.id} — ${o.label} (${o.effect})`));
+  for (;;) {
+    const line = (await readAnswer()).trim();
+    const option = options.find((o, i) => o.id === line || String(i + 1) === line);
+    if (!option) {
+      println(`  not an option: ${line}`);
+      continue;
+    }
+    println(`  → ${option.id}`);
+    await call({ cmd: 'request.respond', sessionId: e.sessionId, requestId: e.requestId, response: { optionId: option.id } });
+    return;
+  }
+}
+
+function printEvent(e: AgentEvent): void {
   if (process.env.WAYPOINT_RAW) return println(JSON.stringify(e));
   switch (e.type) {
     case 'message.delta':
@@ -53,14 +97,21 @@ function onEvent(e: AgentEvent): void {
       return println(`[message.completed] ${e.text.length} chars`);
     case 'activity':
       return println(`[activity ${e.phase}] ${e.kind}: ${e.title}${e.status ? ` (${e.status})` : ''}`);
+    case 'request.opened':
+      return; // printed by answerRequest
     case 'turn.ended':
-      println(`[turn.ended] ${e.outcome}${e.error ? `: ${e.error.message}` : ''}`);
-      return turnEnded(e);
+      return println(`[turn.ended] ${e.outcome}${e.error ? `: ${e.error.message}` : ''}`);
     default: {
       const { sessionId: _s, seq: _q, ts: _t, raw: _r, type, ...rest } = e;
       return println(`[${type}] ${JSON.stringify(rest)}`);
     }
   }
+}
+
+function onEvent(e: AgentEvent): void {
+  printEvent(e);
+  if (e.type === 'request.opened') void answerRequest(e).catch(fail);
+  if (e.type === 'turn.ended') turnEnded(e);
 }
 
 createInterface({ input: child.stdout }).on('line', (line) => {
@@ -95,11 +146,14 @@ async function main(): Promise<void> {
   await call({ cmd: 'shutdown' });
   child.stdin.end();
   println(`[harness] sidecar exited with code ${await exited}`);
+  stdinRl?.close();
 }
 
-main().catch(async (e) => {
+async function fail(e: unknown): Promise<never> {
   println(`[harness] error: ${e instanceof Error ? e.message : e}`);
   child.stdin.end();
   await exited;
   process.exit(1);
-});
+}
+
+main().catch(fail);

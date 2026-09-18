@@ -46,6 +46,9 @@ async function run(msg: Command): Promise<unknown> {
     }
     case 'turn.start':
       return session(msg.sessionId).startTurn(msg.input);
+    case 'request.respond':
+      await session(msg.sessionId).respond(msg.requestId, msg.response);
+      return null;
     case 'turn.interrupt':
       await session(msg.sessionId).interrupt();
       return null;

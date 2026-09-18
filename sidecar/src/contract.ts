@@ -50,7 +50,8 @@ export interface ApprovalRequest {
   kind: 'approval';
   title: string;
   detail?: string;
-  options: { id: string; label: string; effect: 'allow' | 'allow-session' | 'deny' | 'cancel-turn' }[];
+  // 'allow-always' outlives the session (design Deviations 2)
+  options: { id: string; label: string; effect: 'allow' | 'allow-session' | 'allow-always' | 'deny' | 'cancel-turn' }[];
 }
 
 export interface QuestionRequest {
@@ -71,6 +72,7 @@ export type Command =
   | { id: number; cmd: 'probe'; provider: ProviderId }
   | { id: number; cmd: 'session.open'; provider: ProviderId; options: SessionOptions }
   | { id: number; cmd: 'turn.start'; sessionId: string; input: string }
+  | { id: number; cmd: 'request.respond'; sessionId: string; requestId: string; response: InteractionResponse }
   | { id: number; cmd: 'turn.interrupt'; sessionId: string }
   | { id: number; cmd: 'session.close'; sessionId: string }
   | { id: number; cmd: 'shutdown' };

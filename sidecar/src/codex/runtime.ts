@@ -3,6 +3,7 @@ import type {
   AgentEvent,
   AgentRuntime,
   AgentSession,
+  ApprovalRequest,
   InteractionResponse,
   RuntimeStatus,
   SessionOptions,
@@ -12,12 +13,17 @@ import type { InitializeParams } from './generated/InitializeParams.ts';
 import type { InitializeResponse } from './generated/InitializeResponse.ts';
 import type { RequestId } from './generated/RequestId.ts';
 import type { AgentMessageDeltaNotification } from './generated/v2/AgentMessageDeltaNotification.ts';
+import type { CommandExecutionApprovalDecision } from './generated/v2/CommandExecutionApprovalDecision.ts';
+import type { CommandExecutionRequestApprovalParams } from './generated/v2/CommandExecutionRequestApprovalParams.ts';
 import type { ErrorNotification } from './generated/v2/ErrorNotification.ts';
+import type { FileChangeApprovalDecision } from './generated/v2/FileChangeApprovalDecision.ts';
+import type { FileChangeRequestApprovalParams } from './generated/v2/FileChangeRequestApprovalParams.ts';
 import type { GetAccountResponse } from './generated/v2/GetAccountResponse.ts';
 import type { ItemCompletedNotification } from './generated/v2/ItemCompletedNotification.ts';
 import type { ItemStartedNotification } from './generated/v2/ItemStartedNotification.ts';
 import type { ModelListParams } from './generated/v2/ModelListParams.ts';
 import type { ModelListResponse } from './generated/v2/ModelListResponse.ts';
+import type { ServerRequestResolvedNotification } from './generated/v2/ServerRequestResolvedNotification.ts';
 import type { ThreadItem } from './generated/v2/ThreadItem.ts';
 import type { ThreadStartParams } from './generated/v2/ThreadStartParams.ts';
 import type { ThreadStartResponse } from './generated/v2/ThreadStartResponse.ts';
@@ -60,6 +66,32 @@ function describeItem(item: ThreadItem): ActivityFields {
   }
 }
 
+type ApprovalDecision = CommandExecutionApprovalDecision | FileChangeApprovalDecision;
+type ApprovalOption = ApprovalRequest['options'][number];
+
+const DEFAULT_DECISIONS: FileChangeApprovalDecision[] = ['accept', 'acceptForSession', 'decline', 'cancel'];
+
+// Options are generated from the decisions Codex offers for this request (design F).
+function describeDecision(d: ApprovalDecision, index: number): ApprovalOption {
+  if (d === 'accept') return { id: d, label: 'Approve', effect: 'allow' };
+  if (d === 'acceptForSession') return { id: d, label: 'Approve for this session', effect: 'allow-session' };
+  if (d === 'decline') return { id: d, label: 'Decline', effect: 'deny' };
+  if (d === 'cancel') return { id: d, label: 'Cancel turn', effect: 'cancel-turn' };
+  if ('acceptWithExecpolicyAmendment' in d) {
+    const rule = d.acceptWithExecpolicyAmendment.execpolicy_amendment.join(' ');
+    // outlives the session: Codex records the amendment in its exec policy
+    return { id: `acceptWithExecpolicyAmendment:${index}`, label: `Approve and always allow (Codex exec policy): ${rule}`, effect: 'allow-always' };
+  }
+  const { host, action } = d.applyNetworkPolicyAmendment.network_policy_amendment;
+  return {
+    id: `applyNetworkPolicyAmendment:${index}`,
+    label: `${action === 'allow' ? 'Always allow' : 'Always deny'} network host ${host}`,
+    effect: action === 'allow' ? 'allow-always' : 'deny',
+  };
+}
+
+type OpenRequest = { rpcId: RequestId; decisions: Map<string, ApprovalDecision> };
+
 class CodexSession implements AgentSession {
   readonly id = randomUUID();
   readonly providerRef: { provider: 'codex'; nativeId: string };
@@ -67,6 +99,8 @@ class CodexSession implements AgentSession {
   private readonly effort: string | undefined;
   private readonly onEvent: (e: AgentEvent) => void;
   private readonly onClosed: () => void;
+  private readonly requests = new Map<string, OpenRequest>(); // by Waypoint requestId
+  private readonly fileChanges = new Map<string, string>(); // item id -> changed paths
   private seq = 0;
   private turnActive = false;
   private turnId: string | null = null;
@@ -101,12 +135,24 @@ class CodexSession implements AgentSession {
     }
   }
 
-  async respond(_requestId: string, _r: InteractionResponse): Promise<void> {
-    throw new Error('approvals and questions are not implemented yet (slices 4-5)');
+  async respond(requestId: string, r: InteractionResponse): Promise<void> {
+    const req = this.requests.get(requestId);
+    if (!req) throw new Error(`unknown request: ${requestId}`);
+    if (!('optionId' in r)) throw new Error('an approval expects { optionId }');
+    const decision = req.decisions.get(r.optionId);
+    if (decision === undefined) throw new Error(`unknown option: ${r.optionId}`);
+    this.requests.delete(requestId);
+    this.rpc.respond(req.rpcId, { decision });
+    this.emit({ type: 'request.resolved', requestId, by: 'user' });
   }
 
   async interrupt(): Promise<void> {
     if (!this.turnActive || !this.turnId) return;
+    for (const [requestId, req] of this.requests) {
+      this.requests.delete(requestId);
+      this.rpc.respond(req.rpcId, { decision: 'cancel' });
+      this.emit({ type: 'request.resolved', requestId, by: 'interrupt' });
+    }
     const params: TurnInterruptParams = { threadId: this.providerRef.nativeId, turnId: this.turnId };
     await this.rpc.request('turn/interrupt', params);
   }
@@ -135,6 +181,7 @@ class CodexSession implements AgentSession {
       case 'item/started': {
         const p = params as ItemStartedNotification;
         if (p.item.type === 'agentMessage' || p.item.type === 'userMessage') break;
+        if (p.item.type === 'fileChange') this.fileChanges.set(p.item.id, describeItem(p.item).title);
         this.emit({ type: 'activity', turnId: p.turnId, itemId: p.item.id, phase: 'started', ...describeItem(p.item), raw });
         break;
       }
@@ -153,6 +200,7 @@ class CodexSession implements AgentSession {
         if (p.turn.status === 'inProgress') break;
         this.turnActive = false;
         this.turnId = null;
+        this.fileChanges.clear();
         this.emit({
           type: 'turn.ended',
           turnId: p.turn.id,
@@ -160,6 +208,16 @@ class CodexSession implements AgentSession {
           error: p.turn.error ? { message: p.turn.error.message } : undefined,
           raw,
         });
+        break;
+      }
+      case 'serverRequest/resolved': {
+        // also sent after our own answer; only requests that are still open were resolved by Codex
+        const p = params as ServerRequestResolvedNotification;
+        for (const [requestId, req] of this.requests) {
+          if (req.rpcId !== p.requestId) continue;
+          this.requests.delete(requestId);
+          this.emit({ type: 'request.resolved', requestId, by: 'provider', raw });
+        }
         break;
       }
       case 'error': {
@@ -175,13 +233,34 @@ class CodexSession implements AgentSession {
     }
   }
 
-  // Slice 2: no interaction UI yet. Refuse the request and interrupt the turn so it cannot hang.
-  handleServerRequest(id: RequestId, method: string, raw: unknown): void {
-    if (method === 'item/commandExecution/requestApproval' || method === 'item/fileChange/requestApproval') {
-      this.rpc.respond(id, { decision: 'decline' });
-    } else {
-      this.rpc.respondError(id, `${method} is not supported by this client yet`);
+  private openApproval(rpcId: RequestId, turnId: string, available: ApprovalDecision[], title: string, detail: string, raw: unknown): void {
+    const requestId = randomUUID();
+    const decisions = new Map<string, ApprovalDecision>();
+    const options = available.map((d, i) => {
+      const option = describeDecision(d, i);
+      decisions.set(option.id, d);
+      return option;
+    });
+    this.requests.set(requestId, { rpcId, decisions });
+    this.emit({ type: 'request.opened', turnId, requestId, request: { kind: 'approval', title, detail: detail || undefined, options }, raw });
+  }
+
+  // The JSON-RPC id is held until respond(); the turn blocks meanwhile (design G).
+  handleServerRequest(id: RequestId, method: string, params: unknown, raw: unknown): void {
+    if (method === 'item/commandExecution/requestApproval') {
+      const p = params as CommandExecutionRequestApprovalParams;
+      const detail = [p.reason, p.cwd ? `cwd: ${p.cwd}` : null].filter(Boolean).join('\n');
+      this.openApproval(id, p.turnId, p.availableDecisions ?? DEFAULT_DECISIONS, p.command ?? p.kind, detail, raw);
+      return;
     }
+    if (method === 'item/fileChange/requestApproval') {
+      const p = params as FileChangeRequestApprovalParams;
+      const detail = [p.reason, p.grantRoot ? `grant root: ${p.grantRoot}` : null].filter(Boolean).join('\n');
+      this.openApproval(id, p.turnId, DEFAULT_DECISIONS, `Change files: ${this.fileChanges.get(p.itemId) ?? p.itemId}`, detail, raw);
+      return;
+    }
+    // Questions come in slice 5; anything else is refused and the turn interrupted so it cannot hang.
+    this.rpc.respondError(id, `${method} is not supported by this client yet`);
     this.emit({ type: 'notice', level: 'warning', message: `${method} refused (not implemented yet); interrupting the turn`, raw });
     this.interrupt().catch(() => {});
   }
@@ -191,6 +270,7 @@ class CodexSession implements AgentSession {
       this.emit({ type: 'turn.ended', turnId: this.turnId, outcome: 'failed', error: { message: 'codex app-server exited' } });
     }
     this.turnActive = false;
+    this.requests.clear();
     this.emit({ type: 'session.closed', reason: 'process-exit', exitCode: code ?? undefined });
   }
 }
@@ -216,7 +296,7 @@ export class CodexRuntime implements AgentRuntime {
         }
         const threadId = (params as { threadId?: string } | undefined)?.threadId;
         const session = threadId ? this.sessions.get(threadId) : undefined;
-        if (session) session.handleServerRequest(id, method, raw);
+        if (session) session.handleServerRequest(id, method, params, raw);
         else rpc.respondError(id, `${method} is not supported by this client`);
       },
       onExit: (code) => {
