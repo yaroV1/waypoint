@@ -69,6 +69,10 @@ export type InteractionResponse = { optionId: string } | { answers: Record<strin
 
 export type Command =
   | { id: number; cmd: 'probe'; provider: ProviderId }
+  | { id: number; cmd: 'session.open'; provider: ProviderId; options: SessionOptions }
+  | { id: number; cmd: 'turn.start'; sessionId: string; input: string }
+  | { id: number; cmd: 'turn.interrupt'; sessionId: string }
+  | { id: number; cmd: 'session.close'; sessionId: string }
   | { id: number; cmd: 'shutdown' };
 
 export type Reply =
