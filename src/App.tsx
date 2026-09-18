@@ -82,7 +82,7 @@ function App() {
         setProbe(s);
         const m = s.models.find((x) => x.isDefault) ?? s.models[0];
         setModel(m?.id ?? "");
-        setEffort(m?.defaultEffort ?? "");
+        setEffort(m?.defaultEffort ?? m?.efforts[0] ?? "");
       },
       (e) => !stale && setError(`probe failed: ${e.message}`),
     );
@@ -142,7 +142,7 @@ function App() {
             <input
               type="radio"
               checked={provider === p}
-              disabled={busy || p === "claude"}
+              disabled={busy}
               onChange={() => setProvider(p)}
             />
             {p}{" "}
@@ -165,7 +165,8 @@ function App() {
           disabled={busy}
           onChange={(e) => {
             setModel(e.target.value);
-            setEffort(probe?.models.find((m) => m.id === e.target.value)?.defaultEffort ?? "");
+            const m = probe?.models.find((x) => x.id === e.target.value);
+            setEffort(m?.defaultEffort ?? m?.efforts[0] ?? "");
           }}
         >
           {probe?.models.map((m) => (

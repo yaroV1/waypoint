@@ -1,23 +1,17 @@
 import { createInterface } from 'node:readline';
+import { ClaudeRuntime } from './claude/runtime.ts';
 import { CodexRuntime } from './codex/runtime.ts';
-import type { AgentRuntime, AgentSession, Command, EventMessage, Reply, RuntimeStatus } from './contract.ts';
+import type { AgentRuntime, AgentSession, Command, EventMessage, ProviderId, Reply } from './contract.ts';
 
 function send(msg: Reply | EventMessage): void {
   process.stdout.write(JSON.stringify(msg) + '\n');
 }
 
-const runtimes: Partial<Record<'codex' | 'claude', AgentRuntime>> = {
+const runtimes: Record<ProviderId, AgentRuntime> = {
   codex: new CodexRuntime(),
+  claude: new ClaudeRuntime(),
 };
 const sessions = new Map<string, AgentSession>();
-
-// Stub until the Claude adapter lands (slice 3).
-const claudeStub: RuntimeStatus = {
-  available: false,
-  auth: { state: 'unknown' },
-  models: [],
-  traits: { userQuestions: 'native', readOnlyEnforcement: 'permission-policy', effortScope: 'session' },
-};
 
 function session(id: string): AgentSession {
   const s = sessions.get(id);
@@ -40,14 +34,10 @@ async function shutdown(reason: string): Promise<void> {
 
 async function run(msg: Command): Promise<unknown> {
   switch (msg.cmd) {
-    case 'probe': {
-      const runtime = runtimes[msg.provider];
-      return runtime ? runtime.probe() : claudeStub;
-    }
+    case 'probe':
+      return runtimes[msg.provider].probe();
     case 'session.open': {
-      const runtime = runtimes[msg.provider];
-      if (!runtime) throw new Error(`provider not implemented: ${msg.provider}`);
-      const s = await runtime.openSession(msg.options, (event) => {
+      const s = await runtimes[msg.provider].openSession(msg.options, (event) => {
         if (event.type === 'session.closed') sessions.delete(event.sessionId);
         send({ event });
       });
